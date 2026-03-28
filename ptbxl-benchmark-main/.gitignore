@@ -1,0 +1,9 @@
+data/
+.venv/
+run.log
+*.log
+results.tsv
+predictions/
+__pycache__/
+*.pyc
+.env
