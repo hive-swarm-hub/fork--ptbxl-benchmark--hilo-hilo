@@ -14,7 +14,8 @@ import os
 import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, find_peaks
+import pywt
 import lightgbm as lgb
 
 
@@ -92,6 +93,48 @@ def extract_features(X):
         total_power = cumsum[:, -1:] + 1e-10
         rolloff_idx = np.argmax(cumsum >= 0.85 * total_power, axis=1)
         features.append(freqs[rolloff_idx])
+
+    # --- Wavelet features (DWT) using lead II (index 1) — key diagnostic lead ---
+    # Use db4 wavelet, 4 levels — captures QRS, P, T wave morphology
+    wavelet = 'db4'
+    level = 4
+    for i in range(n_leads):
+        lead = X_filt[:, :, i]
+        coeffs_energy = []
+        for sample_idx in range(n_samples):
+            coeffs = pywt.wavedec(lead[sample_idx], wavelet, level=level)
+            energies = [np.sum(c ** 2) for c in coeffs]
+            coeffs_energy.append(energies)
+        coeffs_energy = np.array(coeffs_energy)  # (n_samples, level+1)
+        for lvl in range(level + 1):
+            features.append(coeffs_energy[:, lvl])
+        # Relative energy (ratio) per level
+        total_energy = coeffs_energy.sum(axis=1, keepdims=True) + 1e-10
+        for lvl in range(level + 1):
+            features.append(coeffs_energy[:, lvl] / total_energy[:, 0])
+
+    # --- R-peak features on lead II (index 1) for HRV/heart rate ---
+    lead_ii = X_filt[:, :, 1]  # Lead II
+    hr_features = []
+    for sample_idx in range(n_samples):
+        sig = lead_ii[sample_idx]
+        # Simple R-peak detection: find peaks above 75th percentile
+        thresh = np.percentile(sig, 75)
+        peaks, _ = find_peaks(sig, height=thresh, distance=40)  # min 40 samples = 150bpm
+        n_peaks = len(peaks)
+        if n_peaks >= 2:
+            rr_intervals = np.diff(peaks) / 100.0  # convert to seconds
+            hr = 60.0 / np.mean(rr_intervals)
+            hr_std = np.std(rr_intervals) * 1000  # SDNN in ms
+            rmssd = np.sqrt(np.mean(np.diff(rr_intervals) ** 2)) * 1000
+        else:
+            hr = 0.0
+            hr_std = 0.0
+            rmssd = 0.0
+        hr_features.append([n_peaks, hr, hr_std, rmssd])
+    hr_features = np.array(hr_features)
+    for col in range(hr_features.shape[1]):
+        features.append(hr_features[:, col])
 
     # --- Inter-lead correlation features ---
     lead_pairs = [(0, 1), (0, 6), (1, 6), (6, 7), (7, 8), (8, 9), (9, 10), (10, 11)]
