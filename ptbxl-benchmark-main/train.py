@@ -1,17 +1,22 @@
 """
 PTB-XL 12-Lead ECG Classification
 
-Compact 1D ResNet on raw ECG signals. CNN-only (no LightGBM) to fit <10 min.
+Compact 1D ResNet + LightGBM ensemble. Vectorized feature extraction for speed.
 """
 
 import json
 import os
+import time
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from scipy import stats as sp_stats
+from scipy.signal import butter, filtfilt, find_peaks
+import pywt
+import lightgbm as lgb
 
 
 class ResBlock1D(nn.Module):
@@ -36,7 +41,6 @@ class ResBlock1D(nn.Module):
 
 
 class ECGResNet(nn.Module):
-    """Compact 1D ResNet — ~480K params, ~5 min on CPU for 15 epochs."""
     def __init__(self, n_classes=5):
         super().__init__()
         self.stem = nn.Sequential(
@@ -58,6 +62,97 @@ class ECGResNet(nn.Module):
         return self.fc(self.drop(self.pool(x).squeeze(-1)))
 
 
+def extract_features(X):
+    """Vectorized feature extraction — all heavy ops done per-lead not per-sample."""
+    n_samples, n_timesteps, n_leads = X.shape
+    features = []
+
+    # Bandpass filter: vectorized per-lead
+    t0 = time.time()
+    nyq = 50.0
+    b, a = butter(4, [0.5 / nyq, 40.0 / nyq], btype='band')
+    X_filt = np.empty_like(X)
+    for i in range(n_leads):
+        X_filt[:, :, i] = filtfilt(b, a, X[:, :, i], axis=1)
+    print(f"    bandpass: {time.time()-t0:.1f}s")
+
+    t0 = time.time()
+    for i in range(n_leads):
+        lead = X_filt[:, :, i]
+        features += [
+            np.mean(lead, axis=1), np.std(lead, axis=1),
+            np.min(lead, axis=1), np.max(lead, axis=1),
+            sp_stats.skew(lead, axis=1), sp_stats.kurtosis(lead, axis=1),
+            np.sum(np.diff(np.sign(lead), axis=1) != 0, axis=1).astype(np.float64),
+            np.max(lead, axis=1) - np.min(lead, axis=1),
+            np.percentile(lead, 25, axis=1), np.percentile(lead, 75, axis=1),
+            np.sqrt(np.mean(lead ** 2, axis=1)),
+            np.mean(np.abs(lead - np.mean(lead, axis=1, keepdims=True)), axis=1),
+        ]
+        fft_vals = np.abs(np.fft.rfft(lead, axis=1))
+        freqs = np.fft.rfftfreq(n_timesteps, d=1.0 / 100.0)
+        features.append(np.sum(fft_vals ** 2, axis=1))
+        for flo, fhi in [(0.5, 4), (4, 8), (8, 15), (15, 30), (30, 40)]:
+            mask = (freqs >= flo) & (freqs < fhi)
+            features.append(np.sum(fft_vals[:, mask] ** 2, axis=1))
+        features.append(freqs[np.argmax(fft_vals[:, 1:], axis=1) + 1])
+        psd = fft_vals ** 2
+        psd_norm = psd / (psd.sum(axis=1, keepdims=True) + 1e-10)
+        features.append(-np.sum(psd_norm * np.log(psd_norm + 1e-10), axis=1))
+        features.append(np.sum(freqs * fft_vals, axis=1) / (np.sum(fft_vals, axis=1) + 1e-10))
+        cumsum = np.cumsum(fft_vals ** 2, axis=1)
+        features.append(freqs[np.argmax(cumsum >= 0.85 * (cumsum[:, -1:] + 1e-10), axis=1)])
+    print(f"    stats+fft: {time.time()-t0:.1f}s")
+
+    # Wavelet: vectorized per-lead using axis parameter
+    t0 = time.time()
+    for i in range(n_leads):
+        lead = X_filt[:, :, i]
+        coeffs = pywt.wavedec(lead, 'db4', level=4, axis=1)
+        energies = np.stack([np.sum(c ** 2, axis=1) for c in coeffs], axis=1)  # (N, 5)
+        total = energies.sum(axis=1, keepdims=True) + 1e-10
+        for lvl in range(5):
+            features.append(energies[:, lvl])
+            features.append(energies[:, lvl] / total[:, 0])
+    print(f"    wavelet: {time.time()-t0:.1f}s")
+
+    # Inter-lead correlations
+    for i, j in [(0, 1), (0, 6), (1, 6), (6, 7), (7, 8), (8, 9), (9, 10), (10, 11)]:
+        li, lj = X_filt[:, :, i], X_filt[:, :, j]
+        mi = np.mean(li, axis=1, keepdims=True); mj = np.mean(lj, axis=1, keepdims=True)
+        num = np.sum((li - mi) * (lj - mj), axis=1)
+        den = np.sqrt(np.sum((li - mi)**2, axis=1) * np.sum((lj - mj)**2, axis=1)) + 1e-10
+        features.append(num / den)
+
+    # Temporal segments
+    seg = n_timesteps // 4
+    for s in range(4):
+        for i in range(n_leads):
+            sd = X_filt[:, s*seg:(s+1)*seg, i]
+            features += [np.mean(sd, axis=1), np.std(sd, axis=1)]
+
+    # R-peak/HRV on lead II
+    t0 = time.time()
+    lead_ii = X_filt[:, :, 1]
+    hr_feats = []
+    for s in range(n_samples):
+        sig = lead_ii[s]
+        thresh = np.percentile(sig, 75)
+        peaks, _ = find_peaks(sig, height=thresh, distance=40)
+        if len(peaks) >= 2:
+            rr = np.diff(peaks) / 100.0
+            hr_feats.append([len(peaks), 60.0/np.mean(rr), np.std(rr)*1000,
+                             np.sqrt(np.mean(np.diff(rr)**2))*1000])
+        else:
+            hr_feats.append([0.0, 0.0, 0.0, 0.0])
+    hr_arr = np.array(hr_feats)
+    for c in range(4):
+        features.append(hr_arr[:, c])
+    print(f"    r-peak: {time.time()-t0:.1f}s")
+
+    return np.nan_to_num(np.column_stack(features), nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def main():
     os.makedirs("predictions", exist_ok=True)
 
@@ -72,8 +167,31 @@ def main():
     test_ids = pd.read_csv("data/y_test_ids.csv")["ecg_id"].values
     y_train_np = y_train[classes].values.astype(np.float32)
 
-    # Normalize per lead (train stats)
-    X_tr = X_train.transpose(0, 2, 1).astype(np.float32)  # (N, 12, 1000)
+    # ── LightGBM branch ─────────────────────────────────────────────────────
+    t_lgb = time.time()
+    print("Extracting features for LightGBM...")
+    F_train = extract_features(X_train)
+    print(f"  train features done ({F_train.shape[1]} feat)")
+    F_test = extract_features(X_test)
+    print(f"  test features done")
+
+    lgb_preds = {}
+    for cls in classes:
+        labels = y_train[cls].values
+        n_pos = labels.sum(); n_neg = len(labels) - n_pos; spw = n_neg / max(n_pos, 1)
+        print(f"  LGB {cls} (w={spw:.1f})...")
+        m = lgb.LGBMClassifier(
+            n_estimators=300, max_depth=6, learning_rate=0.05, num_leaves=63,
+            subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
+            random_state=42, n_jobs=-1, verbose=-1,
+        )
+        m.fit(F_train, labels)
+        lgb_preds[cls] = m.predict_proba(F_test)[:, 1]
+    print(f"LGB branch total: {time.time()-t_lgb:.1f}s")
+
+    # ── CNN branch ───────────────────────────────────────────────────────────
+    t_cnn = time.time()
+    X_tr = X_train.transpose(0, 2, 1).astype(np.float32)
     X_te = X_test.transpose(0, 2, 1).astype(np.float32)
     mean = X_tr.mean(axis=(0, 2), keepdims=True)
     std  = X_tr.std(axis=(0, 2), keepdims=True) + 1e-6
@@ -82,23 +200,21 @@ def main():
 
     pos_weight = torch.tensor(
         [(y_train_np[:, i] == 0).sum() / max(y_train_np[:, i].sum(), 1)
-         for i in range(y_train_np.shape[1])],
-        dtype=torch.float32,
+         for i in range(y_train_np.shape[1])], dtype=torch.float32,
     )
-
     loader = DataLoader(
         TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_train_np)),
         batch_size=128, shuffle=True, num_workers=0,
     )
 
-    model = ECGResNet(n_classes=len(classes))
-    opt   = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=15)
-    crit  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    model  = ECGResNet(n_classes=len(classes))
+    opt    = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=12)
+    crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    print("Training 1D ResNet (15 epochs)...")
+    print("Training 1D ResNet (12 epochs)...")
     model.train()
-    for epoch in range(15):
+    for epoch in range(12):
         total_loss = 0.0
         for xb, yb in loader:
             opt.zero_grad()
@@ -108,7 +224,8 @@ def main():
             opt.step()
             total_loss += loss.item()
         sched.step()
-        print(f"  epoch {epoch+1}/15  loss={total_loss/len(loader):.4f}")
+        print(f"  epoch {epoch+1}/12  loss={total_loss/len(loader):.4f}")
+    print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
 
     model.eval()
     X_te_t = torch.from_numpy(X_te)
@@ -116,9 +233,13 @@ def main():
     with torch.no_grad():
         for i in range(0, len(X_te_t), 256):
             preds_arr.append(torch.sigmoid(model(X_te_t[i:i+256])).numpy())
-    preds_arr = np.concatenate(preds_arr, axis=0)
+    cnn_preds_arr = np.concatenate(preds_arr, axis=0)
+    cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
 
-    pred_df = pd.DataFrame({cls: preds_arr[:, i] for i, cls in enumerate(classes)})
+    # ── Ensemble ─────────────────────────────────────────────────────────────
+    predictions = {cls: 0.5 * lgb_preds[cls] + 0.5 * cnn_preds[cls] for cls in classes}
+
+    pred_df = pd.DataFrame(predictions)
     pred_df.insert(0, "ecg_id", test_ids)
     pred_df.to_csv("predictions/predictions.csv", index=False)
     print(f"Done. {len(pred_df)} rows saved.")
