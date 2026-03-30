@@ -89,6 +89,9 @@ class ModelEMA:
         with torch.no_grad():
             for ema_p, p in zip(self.ema.parameters(), model.parameters()):
                 ema_p.data.mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
+            # Copy buffers (BatchNorm running_mean/var) directly from current model
+            for ema_b, b in zip(self.ema.buffers(), model.buffers()):
+                ema_b.copy_(b)
 
 
 def extract_features(X):
