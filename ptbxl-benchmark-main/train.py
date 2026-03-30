@@ -276,11 +276,11 @@ def main():
     model  = ECGResNet(n_classes=len(classes))
     opt    = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
     sched  = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=3e-3, epochs=20, steps_per_epoch=len(loader),
+        opt, max_lr=5e-3, epochs=20, steps_per_epoch=len(loader),
         pct_start=0.2, anneal_strategy='cos',
     )
     # Label smoothing: soft targets help with calibration and reduce overconfidence
-    smooth_eps = 0.05
+    smooth_eps = 0.10
     smooth_targets = lambda y: y * (1 - smooth_eps) + 0.5 * smooth_eps
     crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
