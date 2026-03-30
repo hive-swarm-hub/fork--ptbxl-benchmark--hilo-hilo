@@ -19,6 +19,20 @@ import pywt
 import lightgbm as lgb
 
 
+def augment_batch(x, noise_std=0.05, amp_range=(0.8, 1.2), shift_range=50):
+    """Apply random augmentations to a batch of ECG signals (N, 12, T)."""
+    # Gaussian noise
+    x = x + torch.randn_like(x) * noise_std
+    # Random amplitude scaling per lead
+    amp = torch.empty(x.shape[0], x.shape[1], 1).uniform_(amp_range[0], amp_range[1])
+    x = x * amp
+    # Random time shift
+    shift = torch.randint(-shift_range, shift_range + 1, (1,)).item()
+    if shift != 0:
+        x = torch.roll(x, shift, dims=2)
+    return x
+
+
 class ResBlock1D(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
@@ -209,14 +223,15 @@ def main():
 
     model  = ECGResNet(n_classes=len(classes))
     opt    = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=12)
+    sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
     crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    print("Training 1D ResNet (12 epochs)...")
+    print("Training 1D ResNet (20 epochs, with augmentation)...")
     model.train()
-    for epoch in range(12):
+    for epoch in range(20):
         total_loss = 0.0
         for xb, yb in loader:
+            xb = augment_batch(xb)
             opt.zero_grad()
             loss = crit(model(xb), yb)
             loss.backward()
@@ -224,7 +239,7 @@ def main():
             opt.step()
             total_loss += loss.item()
         sched.step()
-        print(f"  epoch {epoch+1}/12  loss={total_loss/len(loader):.4f}")
+        print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
     print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
 
     model.eval()
