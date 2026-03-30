@@ -280,7 +280,7 @@ def main():
         pct_start=0.2, anneal_strategy='cos',
     )
     # Label smoothing: soft targets help with calibration and reduce overconfidence
-    smooth_eps = 0.10
+    smooth_eps = 0.05
     smooth_targets = lambda y: y * (1 - smooth_eps) + 0.5 * smooth_eps
     crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
