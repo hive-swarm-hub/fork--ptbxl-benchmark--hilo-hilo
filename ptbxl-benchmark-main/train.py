@@ -286,7 +286,7 @@ def main():
     )
     loader = DataLoader(
         TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_train_np)),
-        batch_size=128, shuffle=True, num_workers=0,
+        batch_size=256, shuffle=True, num_workers=0,
     )
 
     # Train 2 models with different seeds (same total epochs = 2×10, more diversity)
@@ -303,12 +303,12 @@ def main():
         model = ECGResNet(n_classes=len(classes))
         opt   = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
         sched = torch.optim.lr_scheduler.OneCycleLR(
-            opt, max_lr=5e-3, epochs=10, steps_per_epoch=len(loader),
+            opt, max_lr=8e-3, epochs=20, steps_per_epoch=len(loader),
             pct_start=0.2, anneal_strategy='cos',
         )
-        print(f"Training ResNet seed={seed} (10 epochs)...")
+        print(f"Training ResNet seed={seed} (20 epochs, batch=256)...")
         model.train()
-        for epoch in range(10):
+        for epoch in range(20):
             total_loss = 0.0
             for xb, yb in loader:
                 xb = augment_batch(xb)
@@ -319,7 +319,7 @@ def main():
                 opt.step()
                 sched.step()
                 total_loss += loss.item()
-            print(f"  epoch {epoch+1}/10  loss={total_loss/len(loader):.4f}")
+            print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
 
         # TTA for this model
         model.eval()
