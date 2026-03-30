@@ -224,6 +224,23 @@ def extract_features(X):
         zc = np.sum(np.diff(np.sign(qrs), axis=1) != 0, axis=1)
         features.append(zc.astype(np.float64))
 
+    # Cornell voltage: S_V3 + R_aVL (key for LVH, threshold 28mm men / 20mm women)
+    s_v3 = np.abs(np.min(X_filt[:, :, 8], axis=1))   # S in V3
+    r_avl = np.max(X_filt[:, :, 4], axis=1)            # R in aVL
+    features.append(s_v3 + r_avl)  # Cornell voltage
+
+    # Lewis index: (R_I - S_I) - (S_III - R_III), negative in right axis deviation
+    r_I   = np.max(X_filt[:, :, 0], axis=1)
+    s_I   = np.abs(np.min(X_filt[:, :, 0], axis=1))
+    r_III = np.max(X_filt[:, :, 2], axis=1)
+    s_III = np.abs(np.min(X_filt[:, :, 2], axis=1))
+    features.append((r_I - s_I) - (s_III - r_III))
+
+    # QRS axis proxy: R-wave amplitude in limb leads
+    for i in [0, 1, 2, 3, 4, 5]:  # I, II, III, aVR, aVL, aVF
+        features.append(np.max(X_filt[:, :, i], axis=1))  # R amplitude
+        features.append(np.abs(np.min(X_filt[:, :, i], axis=1)))  # S depth
+
     return np.nan_to_num(np.column_stack(features), nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -286,54 +303,51 @@ def main():
     )
     loader = DataLoader(
         TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_train_np)),
-        batch_size=256, shuffle=True, num_workers=0,
+        batch_size=128, shuffle=True, num_workers=0,
     )
 
-    # Train 2 models with different seeds (same total epochs = 2×10, more diversity)
+    torch.manual_seed(42)
+    model  = ECGResNet(n_classes=len(classes))
+    opt    = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    sched  = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=5e-3, epochs=20, steps_per_epoch=len(loader),
+        pct_start=0.2, anneal_strategy='cos',
+    )
+    # Label smoothing: soft targets help with calibration and reduce overconfidence
     smooth_eps = 0.05
     smooth_targets = lambda y: y * (1 - smooth_eps) + 0.5 * smooth_eps
-    crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    X_te_t = torch.from_numpy(X_te)
-    n_tta = 8
-    preds_sum = np.zeros((len(X_te_t), len(classes)), dtype=np.float32)
-
-    for seed in [42, 123]:
-        torch.manual_seed(seed)
-        model = ECGResNet(n_classes=len(classes))
-        opt   = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
-        sched = torch.optim.lr_scheduler.OneCycleLR(
-            opt, max_lr=8e-3, epochs=20, steps_per_epoch=len(loader),
-            pct_start=0.2, anneal_strategy='cos',
-        )
-        print(f"Training ResNet seed={seed} (20 epochs, batch=256)...")
-        model.train()
-        for epoch in range(20):
-            total_loss = 0.0
-            for xb, yb in loader:
-                xb = augment_batch(xb)
-                opt.zero_grad()
-                loss = crit(model(xb), smooth_targets(yb))
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                sched.step()
-                total_loss += loss.item()
-            print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
-
-        # TTA for this model
-        model.eval()
-        with torch.no_grad():
-            for i in range(0, len(X_te_t), 256):
-                preds_sum[i:i+256] += torch.sigmoid(model(X_te_t[i:i+256])).numpy()
-            for _ in range(n_tta - 1):
-                for i in range(0, len(X_te_t), 256):
-                    xb = augment_batch(X_te_t[i:i+256].clone(),
-                                       noise_std=0.02, amp_range=(0.92, 1.08), shift_range=20)
-                    preds_sum[i:i+256] += torch.sigmoid(model(xb)).numpy()
-
+    print("Training 1D ResNet (20 epochs, with augmentation)...")
+    model.train()
+    for epoch in range(20):
+        total_loss = 0.0
+        for xb, yb in loader:
+            xb = augment_batch(xb)
+            opt.zero_grad()
+            loss = crit(model(xb), smooth_targets(yb))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            sched.step()
+            total_loss += loss.item()
+        print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
     print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
-    cnn_preds_arr = preds_sum / (2 * n_tta)  # 2 models × n_tta passes
+
+    # Test-Time Augmentation: 1 clean + 15 augmented passes
+    model.eval()
+    X_te_t = torch.from_numpy(X_te)
+    n_tta = 16
+    preds_sum = np.zeros((len(X_te_t), len(classes)), dtype=np.float32)
+    with torch.no_grad():
+        for i in range(0, len(X_te_t), 256):
+            preds_sum[i:i+256] += torch.sigmoid(model(X_te_t[i:i+256])).numpy()
+        for _ in range(n_tta - 1):
+            for i in range(0, len(X_te_t), 256):
+                xb = augment_batch(X_te_t[i:i+256].clone(),
+                                   noise_std=0.02, amp_range=(0.92, 1.08), shift_range=20)
+                preds_sum[i:i+256] += torch.sigmoid(model(xb)).numpy()
+    cnn_preds_arr = preds_sum / n_tta
     cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
 
     # ── Ensemble (per-class weights: GBM helps HYP more) ─────────────────────
