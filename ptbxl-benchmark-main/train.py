@@ -19,6 +19,7 @@ from scipy.signal import butter, filtfilt, find_peaks
 import pywt
 import lightgbm as lgb
 from catboost import CatBoostClassifier
+from xgboost import XGBClassifier
 
 
 def augment_batch(x, noise_std=0.05, amp_range=(0.8, 1.2), shift_range=50):
@@ -224,23 +225,6 @@ def extract_features(X):
         zc = np.sum(np.diff(np.sign(qrs), axis=1) != 0, axis=1)
         features.append(zc.astype(np.float64))
 
-    # Cornell voltage: S_V3 + R_aVL (key for LVH, threshold 28mm men / 20mm women)
-    s_v3 = np.abs(np.min(X_filt[:, :, 8], axis=1))   # S in V3
-    r_avl = np.max(X_filt[:, :, 4], axis=1)            # R in aVL
-    features.append(s_v3 + r_avl)  # Cornell voltage
-
-    # Lewis index: (R_I - S_I) - (S_III - R_III), negative in right axis deviation
-    r_I   = np.max(X_filt[:, :, 0], axis=1)
-    s_I   = np.abs(np.min(X_filt[:, :, 0], axis=1))
-    r_III = np.max(X_filt[:, :, 2], axis=1)
-    s_III = np.abs(np.min(X_filt[:, :, 2], axis=1))
-    features.append((r_I - s_I) - (s_III - r_III))
-
-    # QRS axis proxy: R-wave amplitude in limb leads
-    for i in [0, 1, 2, 3, 4, 5]:  # I, II, III, aVR, aVL, aVF
-        features.append(np.max(X_filt[:, :, i], axis=1))  # R amplitude
-        features.append(np.abs(np.min(X_filt[:, :, i], axis=1)))  # S depth
-
     return np.nan_to_num(np.column_stack(features), nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -284,8 +268,19 @@ def main():
             scale_pos_weight=spw, random_seed=42, verbose=0, thread_count=-1,
         )
         cb_m.fit(F_train, labels)
-        # Average LGB + CatBoost predictions
-        lgb_preds[cls] = 0.5 * lgb_m.predict_proba(F_test)[:, 1] + 0.5 * cb_m.predict_proba(F_test)[:, 1]
+        # XGBoost
+        xgb_m = XGBClassifier(
+            n_estimators=400, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
+            random_state=42, n_jobs=-1, verbosity=0, eval_metric='logloss',
+        )
+        xgb_m.fit(F_train, labels)
+        # Average LGB + CatBoost + XGBoost predictions
+        lgb_preds[cls] = (
+            lgb_m.predict_proba(F_test)[:, 1] +
+            cb_m.predict_proba(F_test)[:, 1] +
+            xgb_m.predict_proba(F_test)[:, 1]
+        ) / 3.0
     print(f"GBM branch total: {time.time()-t_lgb:.1f}s")
 
     # ── CNN branch ───────────────────────────────────────────────────────────
