@@ -195,7 +195,7 @@ def main():
         n_pos = labels.sum(); n_neg = len(labels) - n_pos; spw = n_neg / max(n_pos, 1)
         print(f"  LGB {cls} (w={spw:.1f})...")
         m = lgb.LGBMClassifier(
-            n_estimators=300, max_depth=6, learning_rate=0.05, num_leaves=63,
+            n_estimators=500, max_depth=6, learning_rate=0.05, num_leaves=63,
             subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
             random_state=42, n_jobs=-1, verbose=-1,
         )
