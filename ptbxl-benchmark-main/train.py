@@ -300,13 +300,22 @@ def main():
         print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
     print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
 
+    # Test-Time Augmentation: average over 1 clean + 7 augmented passes
     model.eval()
     X_te_t = torch.from_numpy(X_te)
-    preds_arr = []
+    n_tta = 8
+    preds_sum = np.zeros((len(X_te_t), len(classes)), dtype=np.float32)
     with torch.no_grad():
+        # Clean pass
         for i in range(0, len(X_te_t), 256):
-            preds_arr.append(torch.sigmoid(model(X_te_t[i:i+256])).numpy())
-    cnn_preds_arr = np.concatenate(preds_arr, axis=0)
+            preds_sum[i:i+256] += torch.sigmoid(model(X_te_t[i:i+256])).numpy()
+        # Augmented passes (mild aug to stay near natural distribution)
+        for _ in range(n_tta - 1):
+            for i in range(0, len(X_te_t), 256):
+                xb = augment_batch(X_te_t[i:i+256].clone(),
+                                   noise_std=0.02, amp_range=(0.92, 1.08), shift_range=20)
+                preds_sum[i:i+256] += torch.sigmoid(model(xb)).numpy()
+    cnn_preds_arr = preds_sum / n_tta
     cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
 
     # ── Ensemble ─────────────────────────────────────────────────────────────
