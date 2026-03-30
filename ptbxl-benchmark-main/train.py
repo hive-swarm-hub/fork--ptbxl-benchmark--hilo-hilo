@@ -4,6 +4,7 @@ PTB-XL 12-Lead ECG Classification
 Compact 1D ResNet + LightGBM ensemble. Vectorized feature extraction for speed.
 """
 
+import copy
 import json
 import os
 import time
@@ -75,6 +76,19 @@ class ECGResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         return self.fc(self.drop(self.pool(x).squeeze(-1)))
+
+
+class ModelEMA:
+    """Exponential moving average of model weights for better generalization."""
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        self.decay = decay
+
+    def update(self, model):
+        with torch.no_grad():
+            for ema_p, p in zip(self.ema.parameters(), model.parameters()):
+                ema_p.data.mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
 
 
 def extract_features(X):
@@ -274,6 +288,7 @@ def main():
 
     torch.manual_seed(42)
     model  = ECGResNet(n_classes=len(classes))
+    ema    = ModelEMA(model, decay=0.999)
     opt    = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
     sched  = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=5e-3, epochs=20, steps_per_epoch=len(loader),
@@ -296,25 +311,27 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
+            ema.update(model)
             total_loss += loss.item()
         print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
     print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
 
-    # Test-Time Augmentation: average over 1 clean + 7 augmented passes
-    model.eval()
+    # Test-Time Augmentation using EMA model: 1 clean + 15 augmented passes
+    ema_model = ema.ema
+    ema_model.eval()
     X_te_t = torch.from_numpy(X_te)
     n_tta = 16
     preds_sum = np.zeros((len(X_te_t), len(classes)), dtype=np.float32)
     with torch.no_grad():
         # Clean pass
         for i in range(0, len(X_te_t), 256):
-            preds_sum[i:i+256] += torch.sigmoid(model(X_te_t[i:i+256])).numpy()
+            preds_sum[i:i+256] += torch.sigmoid(ema_model(X_te_t[i:i+256])).numpy()
         # Augmented passes (mild aug to stay near natural distribution)
         for _ in range(n_tta - 1):
             for i in range(0, len(X_te_t), 256):
                 xb = augment_batch(X_te_t[i:i+256].clone(),
                                    noise_std=0.02, amp_range=(0.92, 1.08), shift_range=20)
-                preds_sum[i:i+256] += torch.sigmoid(model(xb)).numpy()
+                preds_sum[i:i+256] += torch.sigmoid(ema_model(xb)).numpy()
     cnn_preds_arr = preds_sum / n_tta
     cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
 
