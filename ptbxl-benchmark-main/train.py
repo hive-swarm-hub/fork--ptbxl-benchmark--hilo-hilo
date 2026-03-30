@@ -289,53 +289,51 @@ def main():
         batch_size=128, shuffle=True, num_workers=0,
     )
 
-    torch.manual_seed(42)
-    model  = ECGResNet(n_classes=len(classes))
-    ema    = ModelEMA(model, decay=0.999)
-    opt    = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
-    sched  = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=5e-3, epochs=20, steps_per_epoch=len(loader),
-        pct_start=0.2, anneal_strategy='cos',
-    )
-    # Label smoothing: soft targets help with calibration and reduce overconfidence
+    # Train 2 models with different seeds (same total epochs = 2×10, more diversity)
     smooth_eps = 0.05
     smooth_targets = lambda y: y * (1 - smooth_eps) + 0.5 * smooth_eps
-    crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    print("Training 1D ResNet (20 epochs, with augmentation)...")
-    model.train()
-    for epoch in range(20):
-        total_loss = 0.0
-        for xb, yb in loader:
-            xb = augment_batch(xb)
-            opt.zero_grad()
-            loss = crit(model(xb), smooth_targets(yb))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            ema.update(model)
-            total_loss += loss.item()
-        print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
-    print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
-
-    # Test-Time Augmentation using EMA model: 1 clean + 15 augmented passes
-    ema_model = ema.ema
-    ema_model.eval()
     X_te_t = torch.from_numpy(X_te)
-    n_tta = 16
+    n_tta = 8
     preds_sum = np.zeros((len(X_te_t), len(classes)), dtype=np.float32)
-    with torch.no_grad():
-        # Clean pass
-        for i in range(0, len(X_te_t), 256):
-            preds_sum[i:i+256] += torch.sigmoid(ema_model(X_te_t[i:i+256])).numpy()
-        # Augmented passes (mild aug to stay near natural distribution)
-        for _ in range(n_tta - 1):
+
+    for seed in [42, 123]:
+        torch.manual_seed(seed)
+        model = ECGResNet(n_classes=len(classes))
+        opt   = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=5e-3, epochs=10, steps_per_epoch=len(loader),
+            pct_start=0.2, anneal_strategy='cos',
+        )
+        print(f"Training ResNet seed={seed} (10 epochs)...")
+        model.train()
+        for epoch in range(10):
+            total_loss = 0.0
+            for xb, yb in loader:
+                xb = augment_batch(xb)
+                opt.zero_grad()
+                loss = crit(model(xb), smooth_targets(yb))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                sched.step()
+                total_loss += loss.item()
+            print(f"  epoch {epoch+1}/10  loss={total_loss/len(loader):.4f}")
+
+        # TTA for this model
+        model.eval()
+        with torch.no_grad():
             for i in range(0, len(X_te_t), 256):
-                xb = augment_batch(X_te_t[i:i+256].clone(),
-                                   noise_std=0.02, amp_range=(0.92, 1.08), shift_range=20)
-                preds_sum[i:i+256] += torch.sigmoid(ema_model(xb)).numpy()
-    cnn_preds_arr = preds_sum / n_tta
+                preds_sum[i:i+256] += torch.sigmoid(model(X_te_t[i:i+256])).numpy()
+            for _ in range(n_tta - 1):
+                for i in range(0, len(X_te_t), 256):
+                    xb = augment_batch(X_te_t[i:i+256].clone(),
+                                       noise_std=0.02, amp_range=(0.92, 1.08), shift_range=20)
+                    preds_sum[i:i+256] += torch.sigmoid(model(xb)).numpy()
+
+    print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
+    cnn_preds_arr = preds_sum / (2 * n_tta)  # 2 models × n_tta passes
     cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
 
     # ── Ensemble (per-class weights: GBM helps HYP more) ─────────────────────
