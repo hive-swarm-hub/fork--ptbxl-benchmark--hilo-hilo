@@ -222,8 +222,11 @@ def main():
     )
 
     model  = ECGResNet(n_classes=len(classes))
-    opt    = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
+    opt    = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    sched  = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=3e-3, epochs=20, steps_per_epoch=len(loader),
+        pct_start=0.2, anneal_strategy='cos',
+    )
     crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     print("Training 1D ResNet (20 epochs, with augmentation)...")
@@ -237,8 +240,8 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            sched.step()
             total_loss += loss.item()
-        sched.step()
         print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
     print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
 
