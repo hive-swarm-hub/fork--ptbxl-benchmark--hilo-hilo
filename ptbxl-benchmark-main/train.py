@@ -17,6 +17,7 @@ from scipy import stats as sp_stats
 from scipy.signal import butter, filtfilt, find_peaks
 import pywt
 import lightgbm as lgb
+from catboost import CatBoostClassifier
 
 
 def augment_batch(x, noise_std=0.05, amp_range=(0.8, 1.2), shift_range=50):
@@ -193,15 +194,23 @@ def main():
     for cls in classes:
         labels = y_train[cls].values
         n_pos = labels.sum(); n_neg = len(labels) - n_pos; spw = n_neg / max(n_pos, 1)
-        print(f"  LGB {cls} (w={spw:.1f})...")
-        m = lgb.LGBMClassifier(
+        print(f"  GBM {cls} (w={spw:.1f})...")
+        # LightGBM
+        lgb_m = lgb.LGBMClassifier(
             n_estimators=500, max_depth=6, learning_rate=0.05, num_leaves=63,
             subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
             random_state=42, n_jobs=-1, verbose=-1,
         )
-        m.fit(F_train, labels)
-        lgb_preds[cls] = m.predict_proba(F_test)[:, 1]
-    print(f"LGB branch total: {time.time()-t_lgb:.1f}s")
+        lgb_m.fit(F_train, labels)
+        # CatBoost
+        cb_m = CatBoostClassifier(
+            iterations=300, depth=6, learning_rate=0.05,
+            scale_pos_weight=spw, random_seed=42, verbose=0, thread_count=-1,
+        )
+        cb_m.fit(F_train, labels)
+        # Average LGB + CatBoost predictions
+        lgb_preds[cls] = 0.5 * lgb_m.predict_proba(F_test)[:, 1] + 0.5 * cb_m.predict_proba(F_test)[:, 1]
+    print(f"GBM branch total: {time.time()-t_lgb:.1f}s")
 
     # ── CNN branch ───────────────────────────────────────────────────────────
     t_cnn = time.time()

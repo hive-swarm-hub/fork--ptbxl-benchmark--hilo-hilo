@@ -7,3 +7,4 @@ lightgbm>=4.0
 wfdb>=4.0
 PyWavelets>=1.4
 torch>=2.0
+catboost>=1.0
