@@ -66,7 +66,6 @@ class ECGResNet(nn.Module):
         self.layer1 = ResBlock1D(32, 64, stride=2)
         self.layer2 = ResBlock1D(64, 128, stride=2)
         self.layer3 = ResBlock1D(128, 128, stride=2)
-        self.layer4 = ResBlock1D(128, 128, stride=1)  # extra depth, no downsampling
         self.pool   = nn.AdaptiveAvgPool1d(1)
         self.drop   = nn.Dropout(0.3)
         self.fc     = nn.Linear(128, n_classes)
@@ -76,8 +75,15 @@ class ECGResNet(nn.Module):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.layer4(x)
         return self.fc(self.drop(self.pool(x).squeeze(-1)))
+
+    def embed(self, x):
+        """Extract 128-dim embedding before the FC layer."""
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        return self.pool(x).squeeze(-1)
 
 
 class ModelEMA:
@@ -243,37 +249,7 @@ def main():
     test_ids = pd.read_csv("data/y_test_ids.csv")["ecg_id"].values
     y_train_np = y_train[classes].values.astype(np.float32)
 
-    # ── LightGBM branch ─────────────────────────────────────────────────────
-    t_lgb = time.time()
-    print("Extracting features for LightGBM...")
-    F_train = extract_features(X_train)
-    print(f"  train features done ({F_train.shape[1]} feat)")
-    F_test = extract_features(X_test)
-    print(f"  test features done")
-
-    lgb_preds = {}
-    for cls in classes:
-        labels = y_train[cls].values
-        n_pos = labels.sum(); n_neg = len(labels) - n_pos; spw = n_neg / max(n_pos, 1)
-        print(f"  GBM {cls} (w={spw:.1f})...")
-        # LightGBM
-        lgb_m = lgb.LGBMClassifier(
-            n_estimators=500, max_depth=6, learning_rate=0.05, num_leaves=63,
-            subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
-            random_state=42, n_jobs=-1, verbose=-1,
-        )
-        lgb_m.fit(F_train, labels)
-        # CatBoost
-        cb_m = CatBoostClassifier(
-            iterations=300, depth=6, learning_rate=0.05,
-            scale_pos_weight=spw, random_seed=42, verbose=0, thread_count=-1,
-        )
-        cb_m.fit(F_train, labels)
-        # Average LGB + CatBoost predictions
-        lgb_preds[cls] = 0.5 * lgb_m.predict_proba(F_test)[:, 1] + 0.5 * cb_m.predict_proba(F_test)[:, 1]
-    print(f"GBM branch total: {time.time()-t_lgb:.1f}s")
-
-    # ── CNN branch ───────────────────────────────────────────────────────────
+    # ── CNN branch (trained first to extract embeddings for GBM) ────────────
     t_cnn = time.time()
     X_tr = X_train.transpose(0, 2, 1).astype(np.float32)
     X_te = X_test.transpose(0, 2, 1).astype(np.float32)
@@ -298,7 +274,6 @@ def main():
         opt, max_lr=5e-3, epochs=20, steps_per_epoch=len(loader),
         pct_start=0.2, anneal_strategy='cos',
     )
-    # Label smoothing: soft targets help with calibration and reduce overconfidence
     smooth_eps = 0.05
     smooth_targets = lambda y: y * (1 - smooth_eps) + 0.5 * smooth_eps
     crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -317,11 +292,18 @@ def main():
             sched.step()
             total_loss += loss.item()
         print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
-    print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
+    print(f"CNN training: {time.time()-t_cnn:.1f}s")
+
+    # Extract 128-dim CNN embeddings to augment GBM features
+    model.eval()
+    X_tr_t = torch.from_numpy(X_tr)
+    X_te_t = torch.from_numpy(X_te)
+    emb_tr = np.vstack([model.embed(X_tr_t[i:i+256]).detach().numpy()
+                        for i in range(0, len(X_tr_t), 256)])
+    emb_te = np.vstack([model.embed(X_te_t[i:i+256]).detach().numpy()
+                        for i in range(0, len(X_te_t), 256)])
 
     # Test-Time Augmentation: 1 clean + 15 augmented passes
-    model.eval()
-    X_te_t = torch.from_numpy(X_te)
     n_tta = 16
     preds_sum = np.zeros((len(X_te_t), len(classes)), dtype=np.float32)
     with torch.no_grad():
@@ -334,13 +316,39 @@ def main():
                 preds_sum[i:i+256] += torch.sigmoid(model(xb)).numpy()
     cnn_preds_arr = preds_sum / n_tta
     cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
+    print(f"CNN branch total (train+TTA): {time.time()-t_cnn:.1f}s")
 
-    # ── Ensemble (per-class weights: GBM helps HYP more) ─────────────────────
-    cnn_w = {'NORM': 0.75, 'MI': 0.75, 'STTC': 0.75, 'CD': 0.75, 'HYP': 0.60}
-    predictions = {
-        cls: (1 - cnn_w.get(cls, 0.7)) * lgb_preds[cls] + cnn_w.get(cls, 0.7) * cnn_preds[cls]
-        for cls in classes
-    }
+    # ── GBM branch (uses hand-crafted + CNN embedding features) ─────────────
+    t_lgb = time.time()
+    print("Extracting hand-crafted features...")
+    F_train = extract_features(X_train)
+    F_test  = extract_features(X_test)
+    # Combine hand-crafted with CNN embeddings
+    F_train = np.hstack([F_train, emb_tr])
+    F_test  = np.hstack([F_test,  emb_te])
+    print(f"  combined features: {F_train.shape[1]}")
+
+    lgb_preds = {}
+    for cls in classes:
+        labels = y_train[cls].values
+        n_pos = labels.sum(); n_neg = len(labels) - n_pos; spw = n_neg / max(n_pos, 1)
+        print(f"  GBM {cls} (w={spw:.1f})...")
+        lgb_m = lgb.LGBMClassifier(
+            n_estimators=500, max_depth=6, learning_rate=0.05, num_leaves=63,
+            subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
+            random_state=42, n_jobs=-1, verbose=-1,
+        )
+        lgb_m.fit(F_train, labels)
+        cb_m = CatBoostClassifier(
+            iterations=300, depth=6, learning_rate=0.05,
+            scale_pos_weight=spw, random_seed=42, verbose=0, thread_count=-1,
+        )
+        cb_m.fit(F_train, labels)
+        lgb_preds[cls] = 0.5 * lgb_m.predict_proba(F_test)[:, 1] + 0.5 * cb_m.predict_proba(F_test)[:, 1]
+    print(f"GBM branch total: {time.time()-t_lgb:.1f}s")
+
+    # ── Ensemble ─────────────────────────────────────────────────────────────
+    predictions = {cls: 0.3 * lgb_preds[cls] + 0.7 * cnn_preds[cls] for cls in classes}
 
     pred_df = pd.DataFrame(predictions)
     pred_df.insert(0, "ecg_id", test_ids)
