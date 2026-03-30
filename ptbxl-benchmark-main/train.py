@@ -276,7 +276,7 @@ def main():
     model  = ECGResNet(n_classes=len(classes))
     opt    = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
     sched  = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=5e-3, epochs=20, steps_per_epoch=len(loader),
+        opt, max_lr=5e-3, epochs=22, steps_per_epoch=len(loader),
         pct_start=0.2, anneal_strategy='cos',
     )
     # Label smoothing: soft targets help with calibration and reduce overconfidence
@@ -284,9 +284,9 @@ def main():
     smooth_targets = lambda y: y * (1 - smooth_eps) + 0.5 * smooth_eps
     crit   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    print("Training 1D ResNet (20 epochs, with augmentation)...")
+    print("Training 1D ResNet (22 epochs, with augmentation)...")
     model.train()
-    for epoch in range(20):
+    for epoch in range(22):
         total_loss = 0.0
         for xb, yb in loader:
             xb = augment_batch(xb)
@@ -297,7 +297,7 @@ def main():
             opt.step()
             sched.step()
             total_loss += loss.item()
-        print(f"  epoch {epoch+1}/20  loss={total_loss/len(loader):.4f}")
+        print(f"  epoch {epoch+1}/22  loss={total_loss/len(loader):.4f}")
     print(f"CNN branch total: {time.time()-t_cnn:.1f}s")
 
     # Test-Time Augmentation: average over 1 clean + 7 augmented passes
@@ -319,7 +319,7 @@ def main():
     cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
 
     # ── Ensemble ─────────────────────────────────────────────────────────────
-    predictions = {cls: 0.2 * lgb_preds[cls] + 0.8 * cnn_preds[cls] for cls in classes}
+    predictions = {cls: 0.3 * lgb_preds[cls] + 0.7 * cnn_preds[cls] for cls in classes}
 
     pred_df = pd.DataFrame(predictions)
     pred_df.insert(0, "ecg_id", test_ids)
