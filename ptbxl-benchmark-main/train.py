@@ -319,7 +319,7 @@ def main():
     cnn_preds = {cls: cnn_preds_arr[:, i] for i, cls in enumerate(classes)}
 
     # ── Ensemble ─────────────────────────────────────────────────────────────
-    predictions = {cls: 0.3 * lgb_preds[cls] + 0.7 * cnn_preds[cls] for cls in classes}
+    predictions = {cls: 0.2 * lgb_preds[cls] + 0.8 * cnn_preds[cls] for cls in classes}
 
     pred_df = pd.DataFrame(predictions)
     pred_df.insert(0, "ecg_id", test_ids)
