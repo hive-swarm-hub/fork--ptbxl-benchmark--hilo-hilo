@@ -165,6 +165,48 @@ def extract_features(X):
         features.append(hr_arr[:, c])
     print(f"    r-peak: {time.time()-t0:.1f}s")
 
+    # ── Clinical features ────────────────────────────────────────────────────
+    # Lead index reference: I=0, II=1, III=2, aVR=3, aVL=4, aVF=5,
+    #                       V1=6, V2=7, V3=8, V4=9, V5=10, V6=11
+
+    # Left-lead vs right-lead amplitude ratio (hypertrophy: high left voltage)
+    left_leads  = [0, 4, 9, 10, 11]   # I, aVL, V4, V5, V6
+    right_leads = [6, 7, 8]           # V1, V2, V3
+    left_amp  = np.mean([np.max(np.abs(X_filt[:, :, i]), axis=1) for i in left_leads], axis=0)
+    right_amp = np.mean([np.max(np.abs(X_filt[:, :, i]), axis=1) for i in right_leads], axis=0)
+    features.append(left_amp)
+    features.append(right_amp)
+    features.append(left_amp / (right_amp + 1e-6))  # L/R ratio — high in LVH
+
+    # Sokolow-Lyon index (S in V1 + R in V5): key for LV hypertrophy
+    s_v1 = np.abs(np.min(X_filt[:, :, 6], axis=1))  # S in V1 (depth of S wave)
+    r_v5 = np.max(X_filt[:, :, 10], axis=1)           # R in V5
+    features.append(s_v1 + r_v5)  # Sokolow-Lyon, >35mm → LVH
+
+    # T-wave polarity per lead (inverted T is diagnostic for MI, STTC)
+    for i in [0, 1, 6, 9, 10, 11]:  # I, II, V1, V4, V5, V6
+        lead = X_filt[:, :, i]
+        # T wave ~ last 30% of signal (after ST segment)
+        t_seg = lead[:, int(0.7 * n_timesteps):]
+        features.append(np.mean(t_seg, axis=1))         # T-wave polarity (pos/neg)
+        features.append(np.max(np.abs(t_seg), axis=1))  # T-wave amplitude
+
+    # ST segment features (ST elevation/depression key for MI and STTC)
+    # ST segment ~ 40-60% of signal (between QRS and T wave)
+    st_start = int(0.35 * n_timesteps)
+    st_end   = int(0.55 * n_timesteps)
+    for i in [0, 1, 6, 9, 10, 11]:
+        st = X_filt[:, st_start:st_end, i]
+        features.append(np.mean(st, axis=1))   # ST level
+        features.append(np.std(st, axis=1))    # ST variability
+
+    # QRS width proxy: zero crossings in middle 30% of signal
+    qrs_seg = X_filt[:, int(0.3*n_timesteps):int(0.6*n_timesteps), :]
+    for i in [1, 6]:  # Lead II, V1
+        qrs = qrs_seg[:, :, i]
+        zc = np.sum(np.diff(np.sign(qrs), axis=1) != 0, axis=1)
+        features.append(zc.astype(np.float64))
+
     return np.nan_to_num(np.column_stack(features), nan=0.0, posinf=0.0, neginf=0.0)
 
 
