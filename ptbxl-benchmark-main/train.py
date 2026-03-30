@@ -19,7 +19,6 @@ from scipy.signal import butter, filtfilt, find_peaks
 import pywt
 import lightgbm as lgb
 from catboost import CatBoostClassifier
-from xgboost import XGBClassifier
 
 
 def augment_batch(x, noise_std=0.05, amp_range=(0.8, 1.2), shift_range=50):
@@ -67,6 +66,7 @@ class ECGResNet(nn.Module):
         self.layer1 = ResBlock1D(32, 64, stride=2)
         self.layer2 = ResBlock1D(64, 128, stride=2)
         self.layer3 = ResBlock1D(128, 128, stride=2)
+        self.layer4 = ResBlock1D(128, 128, stride=1)  # extra depth, no downsampling
         self.pool   = nn.AdaptiveAvgPool1d(1)
         self.drop   = nn.Dropout(0.3)
         self.fc     = nn.Linear(128, n_classes)
@@ -76,6 +76,7 @@ class ECGResNet(nn.Module):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
+        x = self.layer4(x)
         return self.fc(self.drop(self.pool(x).squeeze(-1)))
 
 
@@ -268,19 +269,8 @@ def main():
             scale_pos_weight=spw, random_seed=42, verbose=0, thread_count=-1,
         )
         cb_m.fit(F_train, labels)
-        # XGBoost
-        xgb_m = XGBClassifier(
-            n_estimators=400, max_depth=6, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
-            random_state=42, n_jobs=-1, verbosity=0, eval_metric='logloss',
-        )
-        xgb_m.fit(F_train, labels)
-        # Average LGB + CatBoost + XGBoost predictions
-        lgb_preds[cls] = (
-            lgb_m.predict_proba(F_test)[:, 1] +
-            cb_m.predict_proba(F_test)[:, 1] +
-            xgb_m.predict_proba(F_test)[:, 1]
-        ) / 3.0
+        # Average LGB + CatBoost predictions
+        lgb_preds[cls] = 0.5 * lgb_m.predict_proba(F_test)[:, 1] + 0.5 * cb_m.predict_proba(F_test)[:, 1]
     print(f"GBM branch total: {time.time()-t_lgb:.1f}s")
 
     # ── CNN branch ───────────────────────────────────────────────────────────
