@@ -46,36 +46,31 @@ class ResBlock1D(nn.Module):
 
 
 class ECGResNet(nn.Module):
+    """Compact 1D ResNet — ~480K params, fits <10min on CPU."""
     def __init__(self, n_classes=5):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv1d(12, 32, 15, stride=2, padding=7, bias=False),
+            nn.Conv1d(12, 32, 15, stride=4, padding=7, bias=False),
             nn.BatchNorm1d(32), nn.ReLU(inplace=True),
         )
-        self.layer1 = ResBlock1D(32, 32)
-        self.layer2 = ResBlock1D(32, 64, stride=2)
-        self.layer3 = ResBlock1D(64, 64)
-        self.layer4 = ResBlock1D(64, 128, stride=2)
-        self.layer5 = ResBlock1D(128, 128)
-        self.layer6 = ResBlock1D(128, 256, stride=2)
+        self.layer1 = ResBlock1D(32, 64, stride=2)
+        self.layer2 = ResBlock1D(64, 128, stride=2)
+        self.layer3 = ResBlock1D(128, 128, stride=2)
         self.pool   = nn.AdaptiveAvgPool1d(1)
         self.drop   = nn.Dropout(0.3)
-        self.fc     = nn.Linear(256, n_classes)
+        self.fc     = nn.Linear(128, n_classes)
 
     def forward(self, x):
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.layer5(x)
-        x = self.layer6(x)
         x = self.pool(x).squeeze(-1)
         x = self.drop(x)
         return self.fc(x)
 
 
-def train_cnn(X_train, y_train_np, X_test, n_epochs=20, batch_size=128, lr=1e-3):
+def train_cnn(X_train, y_train_np, X_test, n_epochs=10, batch_size=128, lr=1e-3):
     """Train 1D ResNet, return test probabilities."""
     # Normalize per sample: (sample - mean) / std
     X_tr = X_train.transpose(0, 2, 1).astype(np.float32)  # (N, 12, 1000)
