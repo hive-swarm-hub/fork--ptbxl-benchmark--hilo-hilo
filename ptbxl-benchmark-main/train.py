@@ -303,7 +303,7 @@ def main():
     # Test-Time Augmentation: average over 1 clean + 7 augmented passes
     model.eval()
     X_te_t = torch.from_numpy(X_te)
-    n_tta = 8
+    n_tta = 16
     preds_sum = np.zeros((len(X_te_t), len(classes)), dtype=np.float32)
     with torch.no_grad():
         # Clean pass
